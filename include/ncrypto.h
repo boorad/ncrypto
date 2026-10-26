@@ -29,14 +29,24 @@
 #include <iostream>
 #endif
 
+#ifndef NCRYPTO_EVP_ONLY
+#define NCRYPTO_EVP_ONLY 0
+#endif
+
 #if defined(NCRYPTO_ENGINE_COMPAT) && NCRYPTO_ENGINE_COMPAT &&                 \
-    !defined(OPENSSL_NO_ENGINE)
+    !defined(OPENSSL_NO_ENGINE) && !NCRYPTO_EVP_ONLY
 #include <openssl/engine.h>
-#endif  // NCRYPTO_ENGINE_COMPAT && !OPENSSL_NO_ENGINE
+#endif  // NCRYPTO_ENGINE_COMPAT && !OPENSSL_NO_ENGINE && !NCRYPTO_EVP_ONLY
 
 #ifndef OPENSSL_VERSION_PREREQ
 #define OPENSSL_VERSION_PREREQ(maj, min)                                       \
   (OPENSSL_VERSION_NUMBER >= (((maj) << 28) | ((min) << 20)))
+#endif
+
+#if NCRYPTO_EVP_ONLY &&                                                        \
+    (defined(OPENSSL_IS_BORINGSSL) || defined(LIBRESSL_VERSION_NUMBER) ||      \
+     !OPENSSL_VERSION_PREREQ(3, 6))
+#error "NCRYPTO_EVP_ONLY requires OpenSSL 3.6 or newer"
 #endif
 
 // BoringSSL declares the EVP_*_do_all* APIs, but their implementation may
@@ -1862,7 +1872,7 @@ class HMACCtxPointer final {
 };
 #endif  // OPENSSL_WITH_EVP_MAC
 
-#ifndef OPENSSL_NO_ENGINE
+#if !defined(OPENSSL_NO_ENGINE) && !NCRYPTO_EVP_ONLY
 class EnginePointer final {
  public:
   EnginePointer() = default;
@@ -1898,7 +1908,7 @@ class EnginePointer final {
   void* engine = nullptr;
   bool finish_on_exit = false;
 };
-#endif  // !OPENSSL_NO_ENGINE
+#endif  // !OPENSSL_NO_ENGINE && !NCRYPTO_EVP_ONLY
 
 // ============================================================================
 // FIPS
