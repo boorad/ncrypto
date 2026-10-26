@@ -14,7 +14,7 @@ class Aead final {
   struct AeadInfo {
     std::string name;
     int mode;
-    int nid = 0;  // Note: BoringSSL only defines NIDs for some AEADs
+    int nid = 0; // Note: BoringSSL only defines NIDs for some AEADs
   };
 
  public:
@@ -24,10 +24,16 @@ class Aead final {
   Aead& operator=(const Aead&) = default;
   NCRYPTO_DISALLOW_MOVE(Aead)
 
-  inline const EVP_AEAD* get() const { return aead_; }
+  inline const EVP_AEAD* get() const {
+    return aead_;
+  }
   std::string_view getModeLabel() const;
-  inline operator const EVP_AEAD*() const { return aead_; }
-  inline operator bool() const { return aead_ != nullptr; }
+  inline operator const EVP_AEAD*() const {
+    return aead_;
+  }
+  inline operator bool() const {
+    return aead_ != nullptr;
+  }
 
   int getMode() const;
   int getNonceLength() const;
@@ -84,12 +90,8 @@ class Aead final {
 
 class AeadCtxPointer final {
  public:
-  static AeadCtxPointer New(
-      const Aead& aead,
-      bool encrypt,
-      const unsigned char* key = nullptr,
-      size_t keyLen = 0,
-      size_t tagLen = EVP_AEAD_DEFAULT_TAG_LENGTH /* = 0 */);
+  static AeadCtxPointer New(const Aead& aead, bool encrypt, const unsigned char* key = nullptr, size_t keyLen = 0,
+                            size_t tagLen = EVP_AEAD_DEFAULT_TAG_LENGTH /* = 0 */);
 
   AeadCtxPointer() = default;
   explicit AeadCtxPointer(EVP_AEAD_CTX* ctx);
@@ -101,37 +103,34 @@ class AeadCtxPointer final {
   inline bool operator==(std::nullptr_t) const noexcept {
     return ctx_ == nullptr;
   }
-  inline operator bool() const { return ctx_ != nullptr; }
-  inline EVP_AEAD_CTX* get() const { return ctx_.get(); }
-  inline operator EVP_AEAD_CTX*() const { return ctx_.get(); }
+  inline operator bool() const {
+    return ctx_ != nullptr;
+  }
+  inline EVP_AEAD_CTX* get() const {
+    return ctx_.get();
+  }
+  inline operator EVP_AEAD_CTX*() const {
+    return ctx_.get();
+  }
   void reset(EVP_AEAD_CTX* ctx = nullptr);
   EVP_AEAD_CTX* release();
 
-  bool init(const Aead& aead,
-            bool encrypt,
-            const unsigned char* key = nullptr,
-            size_t keyLen = 0,
+  bool init(const Aead& aead, bool encrypt, const unsigned char* key = nullptr, size_t keyLen = 0,
             size_t tagLen = EVP_AEAD_DEFAULT_TAG_LENGTH /* = 0 */);
 
   // TODO(npaun): BoringSSL does not define NIDs for all AEADs.
   // Decide if we will even implement this method.
   // int getNid() const;
 
-  bool encrypt(const Buffer<const unsigned char>& in,
-               Buffer<unsigned char>& out,
-               Buffer<unsigned char>& tag,
-               const Buffer<const unsigned char>& nonce,
-               const Buffer<const unsigned char>& aad);
+  bool encrypt(const Buffer<const unsigned char>& in, Buffer<unsigned char>& out, Buffer<unsigned char>& tag,
+               const Buffer<const unsigned char>& nonce, const Buffer<const unsigned char>& aad);
 
-  bool decrypt(const Buffer<const unsigned char>& in,
-               Buffer<unsigned char>& out,
-               const Buffer<const unsigned char>& tag,
-               const Buffer<const unsigned char>& nonce,
-               const Buffer<const unsigned char>& aad);
+  bool decrypt(const Buffer<const unsigned char>& in, Buffer<unsigned char>& out, const Buffer<const unsigned char>& tag,
+               const Buffer<const unsigned char>& nonce, const Buffer<const unsigned char>& aad);
 
  private:
   DeleteFnPtr<EVP_AEAD_CTX, EVP_AEAD_CTX_free> ctx_;
 };
-}  // namespace ncrypto
+} // namespace ncrypto
 
-#endif  // OPENSSL_IS_BORINGSSL
+#endif // OPENSSL_IS_BORINGSSL
