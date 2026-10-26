@@ -1,6 +1,6 @@
 #include "ncrypto.h"
 
-#if !defined(OPENSSL_NO_ENGINE) &&                                             \
+#if !NCRYPTO_EVP_ONLY && !defined(OPENSSL_NO_ENGINE) &&                        \
     ((defined(NCRYPTO_ENGINE_COMPAT) && NCRYPTO_ENGINE_COMPAT) ||              \
      NCRYPTO_USE_LEGACY_OPENSSL)
 #include <openssl/engine.h>
@@ -11,7 +11,7 @@ namespace ncrypto {
 // ============================================================================
 // Engine
 
-#ifndef OPENSSL_NO_ENGINE
+#if !defined(OPENSSL_NO_ENGINE) && !NCRYPTO_EVP_ONLY
 EnginePointer::EnginePointer(void* engine_, bool finish_on_exit_)
     : engine(engine_), finish_on_exit(finish_on_exit_) {}
 
@@ -101,6 +101,6 @@ void EnginePointer::initEnginesOnce() {
   }
 }
 
-#endif  // OPENSSL_NO_ENGINE
+#endif  // !OPENSSL_NO_ENGINE && !NCRYPTO_EVP_ONLY
 
 }  // namespace ncrypto

@@ -2,7 +2,11 @@
 #include <ncrypto/aead.h>
 
 #include <gtest/gtest.h>
+#include <array>
+#include <cstring>
 #include <string>
+#include <utility>
+#include <vector>
 
 using namespace ncrypto;
 
@@ -135,6 +139,85 @@ static EVPKeyPointer createTestEcKey() {
   if (!key || !key.set(ecKey)) return {};
   return key;
 }
+
+#if NCRYPTO_USE_OPENSSL3_PROVIDER
+static EVPKeyPointer createProviderKey(int id,
+                                       int curve = NID_undef,
+                                       int encoding = OPENSSL_EC_NAMED_CURVE) {
+  auto ctx = EVPKeyCtxPointer::NewFromID(id);
+  if (!ctx || !ctx.initForKeygen()) return {};
+  if (id == EVP_PKEY_RSA && !ctx.setRsaKeygenBits(2048)) return {};
+  if (id == EVP_PKEY_EC && !ctx.setEcParameters(curve, encoding)) return {};
+
+  EVP_PKEY* raw_key = nullptr;
+  if (EVP_PKEY_keygen(ctx.get(), &raw_key) != 1) return {};
+  return EVPKeyPointer(raw_key);
+}
+
+static Buffer<const unsigned char> bioBuffer(const BIOPointer& bio) {
+  BUF_MEM* mem = bio;
+  return {
+      .data = reinterpret_cast<const unsigned char*>(mem->data),
+      .len = mem->length,
+  };
+}
+
+static DataPointer copyPassphrase(
+    const std::vector<unsigned char>& passphrase) {
+  return DataPointer::Copy(Buffer<const void>{
+      .data = passphrase.data(),
+      .len = passphrase.size(),
+  });
+}
+
+static void expectPrivateKeyRoundTrips(const EVPKeyPointer& key,
+                                       EVPKeyPointer::PKEncodingType type) {
+  using Format = EVPKeyPointer::PKFormatType;
+
+  for (const auto format : {Format::DER, Format::PEM}) {
+    EVPKeyPointer::PrivateKeyEncodingConfig config(false, format, type);
+    auto encoded = key.writePrivateKey(config);
+    ASSERT_TRUE(encoded.has_value);
+
+    auto parsed =
+        EVPKeyPointer::TryParsePrivateKey(config, bioBuffer(encoded.value));
+    ASSERT_TRUE(parsed.has_value);
+    EXPECT_EQ(parsed.value.id(), key.id());
+  }
+
+  const std::array<std::vector<unsigned char>, 2> passphrases = {
+      std::vector<unsigned char>{},
+      std::vector<unsigned char>{'b', 'i', 0, 'n', 'a', 'r', 'y'},
+  };
+  for (const auto& passphrase : passphrases) {
+    EVPKeyPointer::PrivateKeyEncodingConfig config(false, Format::PEM, type);
+    config.cipher = EVP_aes_256_cbc();
+    config.passphrase = copyPassphrase(passphrase);
+
+    auto encoded = key.writePrivateKey(config);
+    ASSERT_TRUE(encoded.has_value);
+    const auto encoded_buffer = bioBuffer(encoded.value);
+
+    auto parsed = EVPKeyPointer::TryParsePrivateKey(config, encoded_buffer);
+    ASSERT_TRUE(parsed.has_value);
+    EXPECT_EQ(parsed.value.id(), key.id());
+
+    EVPKeyPointer::PrivateKeyEncodingConfig absent(false, Format::PEM, type);
+    auto absent_result =
+        EVPKeyPointer::TryParsePrivateKey(absent, encoded_buffer);
+    EXPECT_FALSE(absent_result.has_value);
+    ERR_clear_error();
+
+    EVPKeyPointer::PrivateKeyEncodingConfig wrong(false, Format::PEM, type);
+    wrong.passphrase = copyPassphrase({'w', 'r', 'o', 'n', 'g'});
+    auto wrong_result =
+        EVPKeyPointer::TryParsePrivateKey(wrong, encoded_buffer);
+    EXPECT_FALSE(wrong_result.has_value);
+    EXPECT_EQ(wrong_result.error, EVPKeyPointer::PKParseError::FAILED);
+    ERR_clear_error();
+  }
+}
+#endif
 
 TEST(Ec, getDegree) {
   auto ecKey = createTestEcKey();
@@ -289,6 +372,92 @@ TEST(EVPKeyPointer, cloneEmpty) {
   auto cloned = empty.clone();
   ASSERT_FALSE(cloned);
 }
+
+#if NCRYPTO_USE_OPENSSL3_PROVIDER
+TEST(EVPKeyPointer, traditionalRsaPrivateKeyRoundTrips) {
+  auto key = createProviderKey(EVP_PKEY_RSA);
+  ASSERT_TRUE(key);
+  expectPrivateKeyRoundTrips(key, EVPKeyPointer::PKEncodingType::PKCS1);
+}
+
+TEST(EVPKeyPointer, traditionalEcPrivateKeyRoundTrips) {
+  auto key = createProviderKey(EVP_PKEY_EC, NID_X9_62_prime256v1);
+  ASSERT_TRUE(key);
+  expectPrivateKeyRoundTrips(key, EVPKeyPointer::PKEncodingType::SEC1);
+}
+
+TEST(EVPKeyPointer, explicitEcParametersPreserveSpki) {
+  using Format = EVPKeyPointer::PKFormatType;
+  using Type = EVPKeyPointer::PKEncodingType;
+  const EVPKeyPointer::PublicKeyEncodingConfig config(
+      false, Format::DER, Type::SPKI);
+
+  for (const auto [curve, expected_size] :
+       {std::pair{NID_ipsec3, size_t{210}},
+        std::pair{NID_ipsec4, size_t{238}}}) {
+    if (OBJ_nid2sn(curve) == nullptr) continue;
+
+    auto explicit_key =
+        createProviderKey(EVP_PKEY_EC, curve, OPENSSL_EC_EXPLICIT_CURVE);
+    ASSERT_TRUE(explicit_key);
+    auto encoded = explicit_key.writePublicKey(config);
+    ASSERT_TRUE(encoded.has_value);
+    const auto original = bioBuffer(encoded.value);
+    EXPECT_EQ(original.len, expected_size);
+
+    auto parsed = EVPKeyPointer::TryParsePublicKey(config, original);
+    ASSERT_TRUE(parsed.has_value);
+    auto reencoded = parsed.value.writePublicKey(config);
+    ASSERT_TRUE(reencoded.has_value);
+    const auto round_trip = bioBuffer(reencoded.value);
+    ASSERT_EQ(round_trip.len, original.len);
+    EXPECT_EQ(memcmp(round_trip.data, original.data, original.len), 0);
+
+    auto named_key =
+        createProviderKey(EVP_PKEY_EC, curve, OPENSSL_EC_NAMED_CURVE);
+    ASSERT_TRUE(named_key);
+    auto missing_oid = named_key.writePublicKey(config);
+    EXPECT_FALSE(missing_oid.has_value);
+    ERR_clear_error();
+  }
+}
+
+static bool checkMersennePrime(int exponent, int requested_checks) {
+  BignumPointer candidate(BN_new());
+  if (!candidate || BN_set_bit(candidate.get(), exponent) != 1 ||
+      BN_sub_word(candidate.get(), 1) != 1) {
+    return false;
+  }
+
+  int completed_checks = 0;
+  const int result = candidate.isPrime(
+      requested_checks, [&completed_checks](int event, int iteration) {
+        if (event == 1 && iteration >= 0) completed_checks++;
+        return true;
+      });
+  return result == 1 && completed_checks >= requested_checks;
+}
+
+TEST(BignumPointer, repeatedProviderPrimeChecks) {
+  EXPECT_TRUE(checkMersennePrime(127, 65));
+  EXPECT_TRUE(checkMersennePrime(2203, 129));
+}
+
+TEST(BignumPointer, providerPrimeCheckCancellation) {
+  BignumPointer candidate(BN_new());
+  ASSERT_TRUE(candidate);
+  ASSERT_EQ(BN_set_word(candidate.get(), 65537), 1);
+
+  int callbacks = 0;
+  const int result = candidate.isPrime(65, [&callbacks](int, int) {
+    callbacks++;
+    return false;
+  });
+  EXPECT_EQ(result, -1);
+  EXPECT_EQ(callbacks, 1);
+  ERR_clear_error();
+}
+#endif
 
 // ============================================================================
 // KDF tests
