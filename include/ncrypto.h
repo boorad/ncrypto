@@ -8,6 +8,7 @@
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
+#include <openssl/kdf.h>
 #include <openssl/rsa.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
@@ -16,17 +17,13 @@
 #include <openssl/aead.h>
 #endif
 
-#include <stdint.h>
 #include <cstddef>
-#include <cstdio>
 #include <functional>
 #include <list>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <unordered_map>
-#include <utility>
 
 #if NCRYPTO_DEVELOPMENT_CHECKS
 #include <iostream>
@@ -81,11 +78,21 @@ namespace ncrypto {
 // ============================================================================
 // Utility macros
 
+inline bool EqualNoCase(const std::string_view a, const std::string_view b) {
+  if (a.size() != b.size()) return false;
+  return std::equal(a.begin(), a.end(), b.begin(), b.end(), [](char a, char b) {
+    return std::tolower(a) == std::tolower(b);
+  });
+}
+
 #if NCRYPTO_DEVELOPMENT_CHECKS
 #define NCRYPTO_STR(x) #x
 #define NCRYPTO_REQUIRE(EXPR)                                                  \
   {                                                                            \
-    if (!(EXPR) { abort(); }) }
+    if (!(EXPR)) {                                                             \
+      abort();                                                                 \
+    }                                                                          \
+  }
 
 #define NCRYPTO_FAIL(MESSAGE)                                                  \
   do {                                                                         \
@@ -262,8 +269,6 @@ class ECKeyPointer;
 class Dsa;
 class Rsa;
 class Ec;
-class Aead;
-class AeadCtxPointer;
 
 struct StackOfXASN1Deleter {
   void operator()(STACK_OF(ASN1_OBJECT) * p) const {
@@ -318,25 +323,7 @@ DataPointer xofHashDigest(const Buffer<const unsigned char>& data,
                           const EVP_MD* md,
                           size_t length);
 
-template <typename T>
-class ModeMixin {
- public:
-  std::string_view getModeLabel() const;
-
-  bool isGcmMode() const { return self().getMode() == EVP_CIPH_GCM_MODE; }
-  bool isWrapMode() const { return self().getMode() == EVP_CIPH_WRAP_MODE; }
-  bool isCtrMode() const { return self().getMode() == EVP_CIPH_CTR_MODE; }
-  bool isCcmMode() const { return self().getMode() == EVP_CIPH_CCM_MODE; }
-  bool isOcbMode() const { return self().getMode() == EVP_CIPH_OCB_MODE; }
-  bool isStreamMode() const {
-    return self().getMode() == EVP_CIPH_STREAM_CIPHER;
-  }
-
- private:
-  const T& self() const { return static_cast<const T&>(*this); }
-};
-
-class Cipher final : public ModeMixin<Cipher> {
+class Cipher final {
  public:
   static constexpr size_t MAX_KEY_LENGTH = EVP_MAX_KEY_LENGTH;
   static constexpr size_t MAX_IV_LENGTH = EVP_MAX_IV_LENGTH;
@@ -345,10 +332,12 @@ class Cipher final : public ModeMixin<Cipher> {
 #else
   static constexpr size_t MAX_AUTH_TAG_LENGTH = 16;
 #endif
-  // FIXME: These constants are not available in all OpenSSL/BoringSSL versions
-  // static_assert(EVP_GCM_TLS_TAG_LEN <= MAX_AUTH_TAG_LENGTH &&
-  //               EVP_CCM_TLS_TAG_LEN <= MAX_AUTH_TAG_LENGTH &&
-  //               EVP_CHACHAPOLY_TLS_TAG_LEN <= MAX_AUTH_TAG_LENGTH);
+  static_assert(EVP_GCM_TLS_TAG_LEN <= MAX_AUTH_TAG_LENGTH
+#ifndef OPENSSL_IS_BORINGSSL
+                && EVP_CCM_TLS_TAG_LEN <= MAX_AUTH_TAG_LENGTH &&
+                EVP_CHACHAPOLY_TLS_TAG_LEN <= MAX_AUTH_TAG_LENGTH
+#endif
+  );
 
   Cipher() = default;
   Cipher(const EVP_CIPHER* cipher) : cipher_(cipher) {}
@@ -369,9 +358,15 @@ class Cipher final : public ModeMixin<Cipher> {
   int getIvLength() const;
   int getKeyLength() const;
   int getBlockSize() const;
-
+  std::string_view getModeLabel() const;
   const char* getName() const;
 
+  bool isGcmMode() const;
+  bool isWrapMode() const;
+  bool isCtrMode() const;
+  bool isCcmMode() const;
+  bool isOcbMode() const;
+  bool isStreamMode() const;
   bool isChaCha20Poly1305() const;
 
   bool isSupportedAuthenticatedMode() const;
@@ -464,6 +459,61 @@ class Dsa final {
   OSSL3_CONST DSA* dsa_;
 };
 
+// ============================================================================
+// RSA
+
+class Rsa final {
+ public:
+  Rsa();
+  Rsa(OSSL3_CONST RSA* rsa);
+  NCRYPTO_DISALLOW_COPY_AND_MOVE(Rsa)
+
+  inline operator bool() const { return rsa_ != nullptr; }
+  inline operator OSSL3_CONST RSA*() const { return rsa_; }
+
+  struct PublicKey {
+    const BIGNUM* n;
+    const BIGNUM* e;
+    const BIGNUM* d;
+  };
+  struct PrivateKey {
+    const BIGNUM* p;
+    const BIGNUM* q;
+    const BIGNUM* dp;
+    const BIGNUM* dq;
+    const BIGNUM* qi;
+  };
+  struct PssParams {
+    std::string_view digest = "sha1";
+    std::optional<std::string_view> mgf1_digest = "sha1";
+    int64_t salt_length = 20;
+  };
+
+  const PublicKey getPublicKey() const;
+  const PrivateKey getPrivateKey() const;
+  const std::optional<PssParams> getPssParams() const;
+
+  bool setPublicKey(BignumPointer&& n, BignumPointer&& e);
+  bool setPrivateKey(BignumPointer&& d,
+                     BignumPointer&& q,
+                     BignumPointer&& p,
+                     BignumPointer&& dp,
+                     BignumPointer&& dq,
+                     BignumPointer&& qi);
+
+  using CipherParams = Cipher::CipherParams;
+
+  static DataPointer encrypt(const EVPKeyPointer& key,
+                             const CipherParams& params,
+                             const Buffer<const void> in);
+  static DataPointer decrypt(const EVPKeyPointer& key,
+                             const CipherParams& params,
+                             const Buffer<const void> in);
+
+ private:
+  OSSL3_CONST RSA* rsa_;
+};
+
 class BignumPointer final {
  public:
   BignumPointer() = default;
@@ -535,58 +585,6 @@ class BignumPointer final {
   DeleteFnPtr<BIGNUM, BN_clear_free> bn_;
 
   static bool defaultPrimeCheckCallback(int, int) { return 1; }
-};
-
-class Rsa final {
- public:
-  Rsa();
-  Rsa(OSSL3_CONST RSA* rsa);
-  NCRYPTO_DISALLOW_COPY_AND_MOVE(Rsa)
-
-  inline operator bool() const { return rsa_ != nullptr; }
-  inline operator OSSL3_CONST RSA*() const { return rsa_; }
-
-  struct PublicKey {
-    const BIGNUM* n;
-    const BIGNUM* e;
-    const BIGNUM* d;
-  };
-  struct PrivateKey {
-    const BIGNUM* p;
-    const BIGNUM* q;
-    const BIGNUM* dp;
-    const BIGNUM* dq;
-    const BIGNUM* qi;
-  };
-  struct PssParams {
-    std::string_view digest = "sha1";
-    std::optional<std::string_view> mgf1_digest = "sha1";
-    int64_t salt_length = 20;
-  };
-
-  const PublicKey getPublicKey() const;
-  const PrivateKey getPrivateKey() const;
-  const std::optional<PssParams> getPssParams() const;
-
-  bool setPublicKey(BignumPointer&& n, BignumPointer&& e);
-  bool setPrivateKey(BignumPointer&& d,
-                     BignumPointer&& q,
-                     BignumPointer&& p,
-                     BignumPointer&& dp,
-                     BignumPointer&& dq,
-                     BignumPointer&& qi);
-
-  using CipherParams = Cipher::CipherParams;
-
-  static DataPointer encrypt(const EVPKeyPointer& key,
-                             const CipherParams& params,
-                             const Buffer<const void> in);
-  static DataPointer decrypt(const EVPKeyPointer& key,
-                             const CipherParams& params,
-                             const Buffer<const void> in);
-
- private:
-  OSSL3_CONST RSA* rsa_;
 };
 
 class Ec final {
@@ -692,6 +690,8 @@ class DataPointer final {
   bool isSecure() const { return secure_; }
 
  private:
+  void free();
+
   void* data_ = nullptr;
   size_t len_ = 0;
   bool secure_ = false;
@@ -899,6 +899,9 @@ class EVPKeyPointer final {
     DER,
     PEM,
     JWK,
+    RAW_PUBLIC,
+    RAW_PRIVATE,
+    RAW_SEED,
   };
 
   enum class PKParseError { NOT_RECOGNIZED, NEED_PASSPHRASE, FAILED };
@@ -908,6 +911,7 @@ class EVPKeyPointer final {
     bool output_key_object = false;
     PKFormatType format = PKFormatType::DER;
     PKEncodingType type = PKEncodingType::PKCS8;
+    int ec_point_form = POINT_CONVERSION_UNCOMPRESSED;
     AsymmetricKeyEncodingConfig() = default;
     AsymmetricKeyEncodingConfig(bool output_key_object,
                                 PKFormatType format,
@@ -1622,21 +1626,18 @@ int NoPasswordCallback(char* buf, int size, int rwflag, void* u);
 
 int PasswordCallback(char* buf, int size, int rwflag, void* u);
 
-bool SafeX509SubjectAltNamePrint(const BIOPointer& out, X509_EXTENSION* ext);
-bool SafeX509InfoAccessPrint(const BIOPointer& out, X509_EXTENSION* ext);
+bool SafeX509SubjectAltNamePrint(const BIOPointer& out,
+                                 const X509_EXTENSION* ext);
+bool SafeX509InfoAccessPrint(const BIOPointer& out, const X509_EXTENSION* ext);
 
 // ============================================================================
 // SPKAC
 
-[[deprecated("Use the version that takes a Buffer")]] bool VerifySpkac(
-    const char* input, size_t length);
-
-[[deprecated("Use the version that takes a Buffer")]] BIOPointer
-ExportPublicKey(const char* input, size_t length);
+bool VerifySpkac(const char* input, size_t length);
+BIOPointer ExportPublicKey(const char* input, size_t length);
 
 // The caller takes ownership of the returned Buffer<char>
-[[deprecated("Use the version that takes a Buffer")]] Buffer<char>
-ExportChallenge(const char* input, size_t length);
+Buffer<char> ExportChallenge(const char* input, size_t length);
 
 bool VerifySpkac(const Buffer<const char>& buf);
 BIOPointer ExportPublicKey(const Buffer<const char>& buf);
@@ -1753,145 +1754,6 @@ class KEM final {
 
 #endif  // OPENSSL_VERSION_MAJOR >= 3
 
-// ============================================================================
-// AEAD (Authenticated Encryption with Associated Data)
-// Note that the underlying EVP_AEAD interface is specific to BoringSSL. AEAD
-// primitives are accessed through the Cipher class instead, if using OpenSSL.
-
-#ifdef OPENSSL_IS_BORINGSSL
-class Aead final : public ModeMixin<Aead> {
- private:
-  // BoringSSL does not keep a list of AEADs, so we need to maintain our own.
-  struct AeadInfo {
-    std::string name;
-    int mode;
-    int nid = 0;  // Note: BoringSSL only defines NIDs for some AEADs
-  };
-
- public:
-  Aead() = default;
-  Aead(const AeadInfo* info, const EVP_AEAD* aead) : info_(info), aead_(aead) {}
-  Aead(const Aead&) = default;
-  Aead& operator=(const Aead&) = default;
-  NCRYPTO_DISALLOW_MOVE(Aead)
-
-  inline const EVP_AEAD* get() const { return aead_; }
-  inline operator const EVP_AEAD*() const { return aead_; }
-  inline operator bool() const { return aead_ != nullptr; }
-
-  int getMode() const;
-  int getNonceLength() const;
-  int getKeyLength() const;
-  int getBlockSize() const;
-  int getMaxOverhead() const;
-  int getMaxTagLength() const;
-  std::string_view getName() const;
-
-  static const Aead FromName(std::string_view name);
-
-  // TODO(npaun): BoringSSL does not define NIDs for all AEADs.
-  // This method is included only for implementing getCipherInfo and can't be
-  // used to construct an Aead instance.
-  int getNid() const;
-  // static const AEAD FromNid(int nid);
-
-  static const Aead FromCtx(std::string_view name, const AeadCtxPointer& ctx);
-
-  using AeadNameCallback = std::function<void(std::string_view name)>;
-
-  // Iterates the known ciphers if the underlying implementation
-  // is able to do so.
-  static void ForEach(AeadNameCallback callback);
-
-  // Utilities to get various AEADs by type.
-
-  static const Aead EMPTY;
-  static const Aead AES_128_GCM;
-  static const Aead AES_192_GCM;
-  static const Aead AES_256_GCM;
-  static const Aead CHACHA20_POLY1305;
-  static const Aead XCHACHA20_POLY1305;
-  static const Aead AES_128_CTR_HMAC_SHA256;
-  static const Aead AES_256_CTR_HMAC_SHA256;
-  static const Aead AES_128_GCM_SIV;
-  static const Aead AES_256_GCM_SIV;
-  static const Aead AES_128_GCM_RANDNONCE;
-  static const Aead AES_256_GCM_RANDNONCE;
-  static const Aead AES_128_CCM_BLUETOOTH;
-  static const Aead AES_128_CCM_BLUETOOTH_8;
-  static const Aead AES_128_CCM_MATTER;
-  static const Aead AES_128_EAX;
-  static const Aead AES_256_EAX;
-
- private:
-  const EVP_AEAD* aead_ = nullptr;
-  const AeadInfo* info_ = nullptr;
-
-  using AeadConstructor = const EVP_AEAD* (*)();
-  static const std::unordered_map<AeadConstructor, AeadInfo> aeadIndex;
-  static const Aead FromConstructor(AeadConstructor construct);
-};
-
-class AeadCtxPointer final {
- public:
-  static AeadCtxPointer New(
-      const Aead& aead,
-      bool encrypt,
-      const unsigned char* key = nullptr,
-      size_t keyLen = 0,
-      size_t tagLen = EVP_AEAD_DEFAULT_TAG_LENGTH /* = 0 */);
-
-  AeadCtxPointer() = default;
-  explicit AeadCtxPointer(EVP_AEAD_CTX* ctx);
-  AeadCtxPointer(AeadCtxPointer&& other) noexcept;
-  AeadCtxPointer& operator=(AeadCtxPointer&& other) noexcept;
-  NCRYPTO_DISALLOW_COPY(AeadCtxPointer)
-  ~AeadCtxPointer();
-
-  inline bool operator==(std::nullptr_t) const noexcept {
-    return ctx_ == nullptr;
-  }
-  inline operator bool() const { return ctx_ != nullptr; }
-  inline EVP_AEAD_CTX* get() const { return ctx_.get(); }
-  inline operator EVP_AEAD_CTX*() const { return ctx_.get(); }
-  void reset(EVP_AEAD_CTX* ctx = nullptr);
-  EVP_AEAD_CTX* release();
-
-  bool init(const Aead& aead,
-            bool encrypt,
-            const unsigned char* key = nullptr,
-            size_t keyLen = 0,
-            size_t tagLen = EVP_AEAD_DEFAULT_TAG_LENGTH /* = 0 */);
-
-  // TODO(npaun): BoringSSL does not define NIDs for all AEADs.
-  // Decide if we will even implement this method.
-  // int getNid() const;
-
-  bool encrypt(const Buffer<const unsigned char>& in,
-               Buffer<unsigned char>& out,
-               Buffer<unsigned char>& tag,
-               const Buffer<const unsigned char>& nonce,
-               const Buffer<const unsigned char>& aad);
-
-  bool decrypt(const Buffer<const unsigned char>& in,
-               Buffer<unsigned char>& out,
-               const Buffer<const unsigned char>& tag,
-               const Buffer<const unsigned char>& nonce,
-               const Buffer<const unsigned char>& aad);
-
- private:
-  DeleteFnPtr<EVP_AEAD_CTX, EVP_AEAD_CTX_free> ctx_;
-};
-#endif
-
-// ============================================================================
-// Version metadata
-#define NCRYPTO_VERSION "0.0.1"
-
-enum {
-  NCRYPTO_VERSION_MAJOR = 0,
-  NCRYPTO_VERSION_MINOR = 0,
-  NCRYPTO_VERSION_REVISION = 1,
-};
+#include "ncrypto/version.h"
 
 }  // namespace ncrypto

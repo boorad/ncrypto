@@ -1,5 +1,4 @@
 #include "ncrypto.h"
-
 #include <openssl/asn1.h>
 #include <openssl/bn.h>
 #include <openssl/dh.h>
@@ -8,22 +7,19 @@
 #include <openssl/pkcs12.h>
 #include <openssl/rand.h>
 #include <openssl/x509v3.h>
-#include "openssl/cipher.h"
 
 #ifndef NCRYPTO_NO_KDF_H
 #include <openssl/kdf.h>
-#else
+#endif
+#ifdef OPENSSL_IS_BORINGSSL
 #include <openssl/hkdf.h>
 #endif
 
 #include <algorithm>
 #include <array>
-#include <cctype>
-#include <climits>
 #include <cstring>
 #include <string_view>
 #include <vector>
-
 #if OPENSSL_VERSION_MAJOR >= 3
 #include <openssl/core_names.h>
 #include <openssl/params.h>
@@ -71,8 +67,6 @@ constexpr static PQCMapping pqc_mappings[] = {
                     (qbits),                                                   \
                     nullptr)
 #endif
-
-// ============================================================================
 
 namespace ncrypto {
 namespace {
@@ -233,7 +227,7 @@ void DataPointer::zero() {
   OPENSSL_cleanse(data_, len_);
 }
 
-void DataPointer::reset(void* data, size_t length) {
+void DataPointer::free() {
   if (data_ != nullptr) {
     if (secure_) {
       OPENSSL_secure_clear_free(data_, len_);
@@ -241,6 +235,10 @@ void DataPointer::reset(void* data, size_t length) {
       OPENSSL_clear_free(data_, len_);
     }
   }
+}
+
+void DataPointer::reset(void* data, size_t length) {
+  free();
   data_ = data;
   len_ = length;
 }
@@ -262,8 +260,13 @@ Buffer<void> DataPointer::release() {
 DataPointer DataPointer::resize(size_t len) {
   size_t actual_len = std::min(len_, len);
   auto buf = release();
-  if (actual_len == len_) return DataPointer(buf);
-  buf.data = OPENSSL_realloc(buf.data, actual_len);
+  if (actual_len == len_) return DataPointer(buf.data, actual_len);
+  auto new_data = OPENSSL_realloc(buf.data, actual_len);
+  if (new_data == nullptr) {
+    free();
+    return {};
+  }
+  buf.data = new_data;
   buf.len = actual_len;
   return DataPointer(buf);
 }
@@ -355,12 +358,12 @@ BIGNUM* BignumPointer::release() {
 }
 
 size_t BignumPointer::byteLength() const {
-  if (!bn_) return 0;
+  if (bn_ == nullptr) return 0;
   return BN_num_bytes(bn_.get());
 }
 
 size_t BignumPointer::bitLength() const {
-  if (!bn_) return 0;
+  if (bn_ == nullptr) return 0;
   return BN_num_bits(bn_.get());
 }
 
@@ -473,11 +476,9 @@ int BignumPointer::isPrime(int nchecks,
         // TODO(@jasnell): This could be refactored to allow inlining.
         // Not too important right now tho.
         [](int a, int b, BN_GENCB* ctx) mutable -> int {
-          PrimeCheckCallback& ptr = *static_cast<PrimeCheckCallback*>(ctx->arg);
-          // Newer versions of openssl and boringssl define the BN_GENCB_get_arg
-          // API which is what is supposed to be used here. Older versions,
-          // however, omit that API.
-          // *static_cast<PrimeCheckCallback*>(BN_GENCB_get_arg(ctx));
+          // BN_GENCB is opaque in OpenSSL 3.x, must use accessor
+          PrimeCheckCallback& ptr =
+              *static_cast<PrimeCheckCallback*>(BN_GENCB_get_arg(ctx));
           return ptr(a, b) ? 1 : 0;
         },
         &innerCb);
@@ -507,11 +508,9 @@ bool BignumPointer::generate(const PrimeConfig& params,
     BN_GENCB_set(
         cb.get(),
         [](int a, int b, BN_GENCB* ctx) mutable -> int {
-          PrimeCheckCallback& ptr = *static_cast<PrimeCheckCallback*>(ctx->arg);
-          // Newer versions of openssl and boringssl define the BN_GENCB_get_arg
-          // API which is what is supposed to be used here. Older versions,
-          // however, omit that API.
-          // *static_cast<PrimeCheckCallback*>(BN_GENCB_get_arg(ctx));
+          // BN_GENCB is opaque in OpenSSL 3.x, must use accessor
+          PrimeCheckCallback& ptr =
+              *static_cast<PrimeCheckCallback*>(BN_GENCB_get_arg(ctx));
           return ptr(a, b) ? 1 : 0;
         },
         &innerCb);
@@ -640,9 +639,7 @@ int64_t PortableTimeGM(struct tm* t) {
 // ============================================================================
 // SPKAC
 
-namespace {
-bool VerifySpkacImpl(const char* input, size_t length) {
-  ClearErrorOnReturn clearErrorOnReturn;
+bool VerifySpkac(const char* input, size_t length) {
 #ifdef OPENSSL_IS_BORINGSSL
   // OpenSSL uses EVP_DecodeBlock, which explicitly removes trailing characters,
   // while BoringSSL uses EVP_DecodedLength and EVP_DecodeBase64, which do not.
@@ -660,11 +657,9 @@ bool VerifySpkacImpl(const char* input, size_t length) {
   return pkey ? NETSCAPE_SPKI_verify(spki.get(), pkey.get()) > 0 : false;
 }
 
-BIOPointer ExportPublicKeyImpl(const char* input, size_t length) {
-  ClearErrorOnReturn clearErrorOnReturn;
-  auto bio = BIOPointer::NewMem();
-  if (!bio) [[unlikely]]
-    return {};
+BIOPointer ExportPublicKey(const char* input, size_t length) {
+  BIOPointer bio(BIO_new(BIO_s_mem()));
+  if (!bio) return {};
 
 #ifdef OPENSSL_IS_BORINGSSL
   // OpenSSL uses EVP_DecodeBlock, which explicitly removes trailing characters,
@@ -673,21 +668,17 @@ BIOPointer ExportPublicKeyImpl(const char* input, size_t length) {
   length = std::string_view(input, length).find_last_not_of(" \n\r\t") + 1;
 #endif
   NetscapeSPKIPointer spki(NETSCAPE_SPKI_b64_decode(input, length));
-  if (!spki) [[unlikely]] {
-    return {};
-  }
+  if (!spki) return {};
 
   EVPKeyPointer pkey(NETSCAPE_SPKI_get_pubkey(spki.get()));
+  if (!pkey) return {};
 
-  if (!pkey || PEM_write_bio_PUBKEY(bio.get(), pkey.get()) <= 0) [[unlikely]] {
-    return {};
-  }
+  if (PEM_write_bio_PUBKEY(bio.get(), pkey.get()) <= 0) return {};
 
   return bio;
 }
 
-DataPointer ExportChallengeImpl(const char* input, size_t length) {
-  ClearErrorOnReturn clearErrorOnReturn;
+Buffer<char> ExportChallenge(const char* input, size_t length) {
 #ifdef OPENSSL_IS_BORINGSSL
   // OpenSSL uses EVP_DecodeBlock, which explicitly removes trailing characters,
   // while BoringSSL uses EVP_DecodedLength and EVP_DecodeBase64, which do not.
@@ -700,43 +691,27 @@ DataPointer ExportChallengeImpl(const char* input, size_t length) {
   unsigned char* buf = nullptr;
   int buf_size = ASN1_STRING_to_UTF8(&buf, sp->spkac->challenge);
   if (buf_size >= 0) {
-    return DataPointer({
+    return {
         .data = reinterpret_cast<char*>(buf),
         .len = static_cast<size_t>(buf_size),
-    });
+    };
   }
 
   return {};
 }
-}  // namespace
 
 bool VerifySpkac(const Buffer<const char>& input) {
-  return VerifySpkacImpl(input.data, input.len);
+  return VerifySpkac(input.data, input.len);
 }
 
 BIOPointer ExportPublicKey(const Buffer<const char>& input) {
-  return ExportPublicKeyImpl(input.data, input.len);
+  return ExportPublicKey(input.data, input.len);
 }
 
 DataPointer ExportChallenge(const Buffer<const char>& input) {
-  return ExportChallengeImpl(input.data, input.len);
-}
-
-bool VerifySpkac(const char* input, size_t length) {
-  return VerifySpkacImpl(input, length);
-}
-
-BIOPointer ExportPublicKey(const char* input, size_t length) {
-  return ExportPublicKeyImpl(input, length);
-}
-
-Buffer<char> ExportChallenge(const char* input, size_t length) {
-  if (auto dp = ExportChallengeImpl(input, length)) {
-    auto released = dp.release();
-    return Buffer<char>{
-        .data = static_cast<char*>(released.data),
-        .len = released.len,
-    };
+  auto buf = ExportChallenge(input.data, input.len);
+  if (buf.data != nullptr) {
+    return DataPointer(buf.data, buf.len);
   }
   return {};
 }
@@ -843,11 +818,15 @@ bool PrintGeneralName(const BIOPointer& out, const GENERAL_NAME* gen) {
     // Note that the preferred name syntax (see RFCs 5280 and 1034) with
     // wildcards is a subset of what we consider "safe", so spec-compliant DNS
     // names will never need to be escaped.
-    PrintAltName(out, reinterpret_cast<const char*>(name->data), name->length);
+    PrintAltName(out,
+                 reinterpret_cast<const char*>(ASN1_STRING_get0_data(name)),
+                 ASN1_STRING_length(name));
   } else if (gen->type == GEN_EMAIL) {
     ASN1_IA5STRING* name = gen->d.rfc822Name;
     BIO_write(out.get(), "email:", 6);
-    PrintAltName(out, reinterpret_cast<const char*>(name->data), name->length);
+    PrintAltName(out,
+                 reinterpret_cast<const char*>(ASN1_STRING_get0_data(name)),
+                 ASN1_STRING_length(name));
   } else if (gen->type == GEN_URI) {
     ASN1_IA5STRING* name = gen->d.uniformResourceIdentifier;
     BIO_write(out.get(), "URI:", 4);
@@ -855,7 +834,9 @@ bool PrintGeneralName(const BIOPointer& out, const GENERAL_NAME* gen) {
     // with a few exceptions, most notably URIs that contains commas (see
     // RFC 2396). In other words, most legitimate URIs will not require
     // escaping.
-    PrintAltName(out, reinterpret_cast<const char*>(name->data), name->length);
+    PrintAltName(out,
+                 reinterpret_cast<const char*>(ASN1_STRING_get0_data(name)),
+                 ASN1_STRING_length(name));
   } else if (gen->type == GEN_DIRNAME) {
     // Earlier versions of Node.js used X509_NAME_oneline to print the X509_NAME
     // object. The format was non standard and should be avoided. The use of
@@ -888,17 +869,18 @@ bool PrintGeneralName(const BIOPointer& out, const GENERAL_NAME* gen) {
   } else if (gen->type == GEN_IPADD) {
     BIO_printf(out.get(), "IP Address:");
     const ASN1_OCTET_STRING* ip = gen->d.ip;
-    const unsigned char* b = ip->data;
-    if (ip->length == 4) {
+    const unsigned char* b = ASN1_STRING_get0_data(ip);
+    int ip_len = ASN1_STRING_length(ip);
+    if (ip_len == 4) {
       BIO_printf(out.get(), "%d.%d.%d.%d", b[0], b[1], b[2], b[3]);
-    } else if (ip->length == 16) {
+    } else if (ip_len == 16) {
       for (unsigned int j = 0; j < 8; j++) {
         uint16_t pair = (b[2 * j] << 8) | b[2 * j + 1];
         BIO_printf(out.get(), (j == 0) ? "%X" : ":%X", pair);
       }
     } else {
 #if OPENSSL_VERSION_MAJOR >= 3
-      BIO_printf(out.get(), "<invalid length=%d>", ip->length);
+      BIO_printf(out.get(), "<invalid length=%d>", ip_len);
 #else
       BIO_printf(out.get(), "<invalid>");
 #endif
@@ -948,15 +930,15 @@ bool PrintGeneralName(const BIOPointer& out, const GENERAL_NAME* gen) {
       if (unicode) {
         auto name = gen->d.otherName->value->value.utf8string;
         PrintAltName(out,
-                     reinterpret_cast<const char*>(name->data),
-                     name->length,
+                     reinterpret_cast<const char*>(ASN1_STRING_get0_data(name)),
+                     ASN1_STRING_length(name),
                      AltNameOption::UTF8,
                      prefix);
       } else {
         auto name = gen->d.otherName->value->value.ia5string;
         PrintAltName(out,
-                     reinterpret_cast<const char*>(name->data),
-                     name->length,
+                     reinterpret_cast<const char*>(ASN1_STRING_get0_data(name)),
+                     ASN1_STRING_length(name),
                      AltNameOption::NONE,
                      prefix);
       }
@@ -977,11 +959,14 @@ bool PrintGeneralName(const BIOPointer& out, const GENERAL_NAME* gen) {
 }
 }  // namespace
 
-bool SafeX509SubjectAltNamePrint(const BIOPointer& out, X509_EXTENSION* ext) {
-  auto ret = OBJ_obj2nid(X509_EXTENSION_get_object(ext));
+bool SafeX509SubjectAltNamePrint(const BIOPointer& out,
+                                 const X509_EXTENSION* ext) {
+  // const_cast needed for OpenSSL < 4.0 which lacks const-correctness
+  auto* mext = const_cast<X509_EXTENSION*>(ext);
+  auto ret = OBJ_obj2nid(X509_EXTENSION_get_object(mext));
   if (ret != NID_subject_alt_name) return false;
 
-  GENERAL_NAMES* names = static_cast<GENERAL_NAMES*>(X509V3_EXT_d2i(ext));
+  GENERAL_NAMES* names = static_cast<GENERAL_NAMES*>(X509V3_EXT_d2i(mext));
   if (names == nullptr) return false;
 
   bool ok = true;
@@ -1000,12 +985,14 @@ bool SafeX509SubjectAltNamePrint(const BIOPointer& out, X509_EXTENSION* ext) {
   return ok;
 }
 
-bool SafeX509InfoAccessPrint(const BIOPointer& out, X509_EXTENSION* ext) {
-  auto ret = OBJ_obj2nid(X509_EXTENSION_get_object(ext));
+bool SafeX509InfoAccessPrint(const BIOPointer& out, const X509_EXTENSION* ext) {
+  // const_cast needed for OpenSSL < 4.0 which lacks const-correctness
+  auto* mext = const_cast<X509_EXTENSION*>(ext);
+  auto ret = OBJ_obj2nid(X509_EXTENSION_get_object(mext));
   if (ret != NID_info_access) return false;
 
   AUTHORITY_INFO_ACCESS* descs =
-      static_cast<AUTHORITY_INFO_ACCESS*>(X509V3_EXT_d2i(ext));
+      static_cast<AUTHORITY_INFO_ACCESS*>(X509V3_EXT_d2i(mext));
   if (descs == nullptr) return false;
 
   bool ok = true;
@@ -1149,7 +1136,7 @@ BIOPointer X509View::getValidFrom() const {
   if (cert_ == nullptr) return {};
   BIOPointer bio(BIO_new(BIO_s_mem()));
   if (!bio) return {};
-  ASN1_TIME_print(bio.get(), X509_get_notBefore(cert_));
+  ASN1_TIME_print(bio.get(), X509_get0_notBefore(cert_));
   return bio;
 }
 
@@ -1158,7 +1145,7 @@ BIOPointer X509View::getValidTo() const {
   if (cert_ == nullptr) return {};
   BIOPointer bio(BIO_new(BIO_s_mem()));
   if (!bio) return {};
-  ASN1_TIME_print(bio.get(), X509_get_notAfter(cert_));
+  ASN1_TIME_print(bio.get(), X509_get0_notAfter(cert_));
   return bio;
 }
 
@@ -1411,16 +1398,10 @@ bool X509View::enumUsages(UsageCallback callback) const {
 
 bool X509View::ifRsa(KeyCallback<Rsa> callback) const {
   if (cert_ == nullptr) return true;
-  // The const_cast is a bit unfortunate. The X509_get_pubkey API accepts
-  // a const X509* in newer versions of openssl and boringssl but a non-const
-  // X509* in older versions. By removing the const if it exists we can
-  // support both.
-  EVPKeyPointer pkey(X509_get_pubkey(const_cast<X509*>(cert_)));
-  if (!pkey) [[unlikely]]
-    return true;
-  auto id = pkey.id();
+  OSSL3_CONST EVP_PKEY* pkey = X509_get0_pubkey(cert_);
+  auto id = EVP_PKEY_id(pkey);
   if (id == EVP_PKEY_RSA || id == EVP_PKEY_RSA2 || id == EVP_PKEY_RSA_PSS) {
-    Rsa rsa = pkey;
+    Rsa rsa(EVP_PKEY_get0_RSA(pkey));
     if (!rsa) [[unlikely]]
       return true;
     return callback(rsa);
@@ -1430,16 +1411,10 @@ bool X509View::ifRsa(KeyCallback<Rsa> callback) const {
 
 bool X509View::ifEc(KeyCallback<Ec> callback) const {
   if (cert_ == nullptr) return true;
-  // The const_cast is a bit unfortunate. The X509_get_pubkey API accepts
-  // a const X509* in newer versions of openssl and boringssl but a non-const
-  // X509* in older versions. By removing the const if it exists we can
-  // support both.
-  EVPKeyPointer pkey(X509_get_pubkey(const_cast<X509*>(cert_)));
-  if (!pkey) [[unlikely]]
-    return true;
-  auto id = pkey.id();
+  OSSL3_CONST EVP_PKEY* pkey = X509_get0_pubkey(cert_);
+  auto id = EVP_PKEY_id(pkey);
   if (id == EVP_PKEY_EC) {
-    Ec ec = pkey;
+    Ec ec(EVP_PKEY_get0_EC_KEY(pkey));
     if (!ec) [[unlikely]]
       return true;
     return callback(ec);
@@ -1560,6 +1535,7 @@ BIOPointer BIOPointer::NewSecMem() {
 }
 
 BIOPointer BIOPointer::New(const BIO_METHOD* method) {
+  if (method == nullptr) return {};
   return BIOPointer(BIO_new(method));
 }
 
@@ -1588,15 +1564,6 @@ int BIOPointer::Write(BIOPointer* bio, std::string_view message) {
 
 // ============================================================================
 // DHPointer
-
-namespace {
-bool EqualNoCase(const std::string_view a, const std::string_view b) {
-  if (a.size() != b.size()) return false;
-  return std::equal(a.begin(), a.end(), b.begin(), b.end(), [](char a, char b) {
-    return std::tolower(a) == std::tolower(b);
-  });
-}
-}  // namespace
 
 DHPointer::DHPointer(DH* dh) : dh_(dh) {}
 
@@ -1894,7 +1861,18 @@ bool hkdfInfo(const Digest& md,
     actual_salt = {default_salt, static_cast<unsigned>(md.size())};
   }
 
-#ifndef NCRYPTO_NO_KDF_H
+#ifdef OPENSSL_IS_BORINGSSL
+  if (out == nullptr || out->len != length) return false;
+  return HKDF(out->data,
+              length,
+              md,
+              key.data,
+              key.len,
+              reinterpret_cast<const unsigned char*>(actual_salt.data()),
+              actual_salt.size(),
+              info.data,
+              info.len) == 1;
+#else
   auto ctx = EVPKeyCtxPointer::NewFromID(EVP_PKEY_HKDF);
   // OpenSSL < 3.0.0 accepted only a void* as the argument of
   // EVP_PKEY_CTX_set_hkdf_md.
@@ -1932,16 +1910,6 @@ bool hkdfInfo(const Digest& md,
   if (out == nullptr || out->len != length) return false;
 
   return EVP_PKEY_derive(ctx.get(), out->data, &length) > 0;
-#else
-  return HKDF(out->data,
-              length,
-              md,
-              key.data,
-              key.len,
-              salt.data,
-              salt.len,
-              info.data,
-              info.len);
 #endif
 }
 
@@ -1952,10 +1920,14 @@ DataPointer hkdf(const Digest& md,
                  size_t length) {
   auto buf = DataPointer::Alloc(length);
   if (!buf) return {};
-  Buffer<unsigned char> out = buf;
-
-  return hkdfInfo(md, key, info, salt, length, &out) ? std::move(buf)
-                                                     : DataPointer();
+  Buffer<unsigned char> out{
+      .data = static_cast<unsigned char*>(buf.get()),
+      .len = length,
+  };
+  if (hkdfInfo(md, key, info, salt, length, &out)) {
+    return buf;
+  }
+  return {};
 }
 
 bool checkScryptParams(uint64_t N, uint64_t r, uint64_t p, uint64_t maxmem) {
@@ -1977,20 +1949,16 @@ bool scryptInto(const Buffer<const char>& pass,
     return false;
   }
 
-  if (auto dp = DataPointer::Alloc(length)) {
-    return EVP_PBE_scrypt(pass.data,
-                          pass.len,
-                          salt.data,
-                          salt.len,
-                          N,
-                          r,
-                          p,
-                          maxmem,
-                          out->data,
-                          length);
-  }
-
-  return false;
+  return EVP_PBE_scrypt(pass.data,
+                        pass.len,
+                        salt.data,
+                        salt.len,
+                        N,
+                        r,
+                        p,
+                        maxmem,
+                        out->data,
+                        length) == 1;
 }
 
 DataPointer scrypt(const Buffer<const char>& pass,
@@ -2000,11 +1968,24 @@ DataPointer scrypt(const Buffer<const char>& pass,
                    uint64_t p,
                    uint64_t maxmem,
                    size_t length) {
-  if (auto dp = DataPointer::Alloc(length)) {
-    Buffer<unsigned char> buf = dp;
-    if (scryptInto(pass, salt, N, r, p, maxmem, length, &buf)) {
-      return dp;
-    }
+  ClearErrorOnReturn clearErrorOnReturn;
+
+  if (pass.len > INT_MAX || salt.len > INT_MAX) {
+    return {};
+  }
+
+  auto dp = DataPointer::Alloc(length);
+  if (dp && EVP_PBE_scrypt(pass.data,
+                           pass.len,
+                           salt.data,
+                           salt.len,
+                           N,
+                           r,
+                           p,
+                           maxmem,
+                           reinterpret_cast<unsigned char*>(dp.get()),
+                           length)) {
+    return dp;
   }
 
   return {};
@@ -2024,18 +2005,14 @@ bool pbkdf2Into(const Digest& md,
   }
 
   const EVP_MD* md_ptr = md;
-  if (PKCS5_PBKDF2_HMAC(pass.data,
-                        pass.len,
-                        salt.data,
-                        salt.len,
-                        iterations,
-                        md_ptr,
-                        length,
-                        out->data)) {
-    return true;
-  }
-
-  return false;
+  return PKCS5_PBKDF2_HMAC(pass.data,
+                           pass.len,
+                           salt.data,
+                           salt.len,
+                           iterations,
+                           md_ptr,
+                           length,
+                           out->data) == 1;
 }
 
 DataPointer pbkdf2(const Digest& md,
@@ -2043,11 +2020,23 @@ DataPointer pbkdf2(const Digest& md,
                    const Buffer<const unsigned char>& salt,
                    uint32_t iterations,
                    size_t length) {
-  if (auto dp = DataPointer::Alloc(length)) {
-    Buffer<unsigned char> buf = dp;
-    if (pbkdf2Into(md, pass, salt, iterations, length, &buf)) {
-      return dp;
-    }
+  ClearErrorOnReturn clearErrorOnReturn;
+
+  if (pass.len > INT_MAX || salt.len > INT_MAX || length > INT_MAX) {
+    return {};
+  }
+
+  auto dp = DataPointer::Alloc(length);
+  const EVP_MD* md_ptr = md;
+  if (dp && PKCS5_PBKDF2_HMAC(pass.data,
+                              pass.len,
+                              salt.data,
+                              salt.len,
+                              iterations,
+                              md_ptr,
+                              length,
+                              reinterpret_cast<unsigned char*>(dp.get()))) {
+    return dp;
   }
 
   return {};
@@ -2249,12 +2238,6 @@ EVPKeyPointer::EVPKeyPointer(EVP_PKEY* pkey) : pkey_(pkey) {}
 
 EVPKeyPointer::EVPKeyPointer(EVPKeyPointer&& other) noexcept
     : pkey_(other.release()) {}
-
-EVPKeyPointer EVPKeyPointer::clone() const {
-  if (!pkey_) return {};
-  if (!EVP_PKEY_up_ref(pkey_.get())) return {};
-  return EVPKeyPointer(pkey_.get());
-}
 
 EVPKeyPointer& EVPKeyPointer::operator=(EVPKeyPointer&& other) noexcept {
   if (this == &other) return *this;
@@ -2604,7 +2587,6 @@ EVPKeyPointer::ParseKeyResult EVPKeyPointer::TryParsePrivateKey(
           ERR_GET_REASON(err) == PEM_R_BAD_PASSWORD_READ && !had_passphrase) {
         return ParseKeyResult(PKParseError::NEED_PASSPHRASE);
       }
-
       return ParseKeyResult(PKParseError::FAILED, err);
     }
     if (!pkey) return ParseKeyResult(PKParseError::FAILED);
@@ -2680,8 +2662,11 @@ Result<BIOPointer, bool> EVPKeyPointer::writePrivateKey(
       // PKCS1 is only permitted for RSA keys.
       if (id() != EVP_PKEY_RSA) return Result<BIOPointer, bool>(false);
 
-      OSSL3_CONST RSA* rsa = EVP_PKEY_get0_RSA(get());
-
+#if OPENSSL_VERSION_MAJOR >= 3
+      const RSA* rsa = EVP_PKEY_get0_RSA(get());
+#else
+      RSA* rsa = EVP_PKEY_get0_RSA(get());
+#endif
       switch (config.format) {
         case PKFormatType::PEM: {
           err = PEM_write_bio_RSAPrivateKey(
@@ -2740,8 +2725,11 @@ Result<BIOPointer, bool> EVPKeyPointer::writePrivateKey(
       // SEC1 is only permitted for EC keys
       if (id() != EVP_PKEY_EC) return Result<BIOPointer, bool>(false);
 
-      OSSL3_CONST EC_KEY* ec = EVP_PKEY_get0_EC_KEY(get());
-
+#if OPENSSL_VERSION_MAJOR >= 3
+      const EC_KEY* ec = EVP_PKEY_get0_EC_KEY(get());
+#else
+      EC_KEY* ec = EVP_PKEY_get0_EC_KEY(get());
+#endif
       switch (config.format) {
         case PKFormatType::PEM: {
           err = PEM_write_bio_ECPrivateKey(
@@ -2926,9 +2914,15 @@ EVPKeyPointer::operator Ec() const {
   return Ec(ec);
 }
 
+EVPKeyPointer EVPKeyPointer::clone() const {
+  if (!pkey_) return {};
+  if (!EVP_PKEY_up_ref(pkey_.get())) return {};
+  return EVPKeyPointer(pkey_.get());
+}
+
 bool EVPKeyPointer::validateDsaParameters() const {
   if (!pkey_) return false;
-    /* Validate DSA2 parameters from FIPS 186-4 */
+  /* Validate DSA2 parameters from FIPS 186-4 */
 #if OPENSSL_VERSION_MAJOR >= 3
   if (EVP_default_properties_is_fips_enabled(nullptr) && EVP_PKEY_DSA == id()) {
 #else
@@ -3227,36 +3221,6 @@ bool SSLCtxPointer::setCipherSuites(const char* ciphers) {
   return true;
 #endif
 }
-// ============================================================================
-
-template <typename T>
-std::string_view ModeMixin<T>::getModeLabel() const {
-  switch (self().getMode()) {
-    case EVP_CIPH_CCM_MODE:
-      return "ccm";
-    case EVP_CIPH_CFB_MODE:
-      return "cfb";
-    case EVP_CIPH_CBC_MODE:
-      return "cbc";
-    case EVP_CIPH_CTR_MODE:
-      return "ctr";
-    case EVP_CIPH_ECB_MODE:
-      return "ecb";
-    case EVP_CIPH_GCM_MODE:
-      return "gcm";
-    case EVP_CIPH_OCB_MODE:
-      return "ocb";
-    case EVP_CIPH_OFB_MODE:
-      return "ofb";
-    case EVP_CIPH_WRAP_MODE:
-      return "wrap";
-    case EVP_CIPH_XTS_MODE:
-      return "xts";
-    case EVP_CIPH_STREAM_CIPHER:
-      return "stream";
-  }
-  return "{unknown}";
-}
 
 // ============================================================================
 
@@ -3294,13 +3258,43 @@ const Cipher Cipher::AES_256_OCB = Cipher::FromNid(NID_aes_256_ocb);
 
 const Cipher Cipher::CHACHA20_POLY1305 = Cipher::FromNid(NID_chacha20_poly1305);
 
+bool Cipher::isGcmMode() const {
+  if (!cipher_) return false;
+  return getMode() == EVP_CIPH_GCM_MODE;
+}
+
+bool Cipher::isWrapMode() const {
+  if (!cipher_) return false;
+  return getMode() == EVP_CIPH_WRAP_MODE;
+}
+
+bool Cipher::isCtrMode() const {
+  if (!cipher_) return false;
+  return getMode() == EVP_CIPH_CTR_MODE;
+}
+
+bool Cipher::isCcmMode() const {
+  if (!cipher_) return false;
+  return getMode() == EVP_CIPH_CCM_MODE;
+}
+
+bool Cipher::isOcbMode() const {
+  if (!cipher_) return false;
+  return getMode() == EVP_CIPH_OCB_MODE;
+}
+
+bool Cipher::isStreamMode() const {
+  if (!cipher_) return false;
+  return getMode() == EVP_CIPH_STREAM_CIPHER;
+}
+
 bool Cipher::isChaCha20Poly1305() const {
   if (!cipher_) return false;
   return getNid() == NID_chacha20_poly1305;
 }
 
 int Cipher::getMode() const {
-  if (!cipher_) return -1;
+  if (!cipher_) return 0;
   return EVP_CIPHER_mode(cipher_);
 }
 
@@ -3322,6 +3316,35 @@ int Cipher::getBlockSize() const {
 int Cipher::getNid() const {
   if (!cipher_) return 0;
   return EVP_CIPHER_nid(cipher_);
+}
+
+std::string_view Cipher::getModeLabel() const {
+  if (!cipher_) return {};
+  switch (getMode()) {
+    case EVP_CIPH_CCM_MODE:
+      return "ccm";
+    case EVP_CIPH_CFB_MODE:
+      return "cfb";
+    case EVP_CIPH_CBC_MODE:
+      return "cbc";
+    case EVP_CIPH_CTR_MODE:
+      return "ctr";
+    case EVP_CIPH_ECB_MODE:
+      return "ecb";
+    case EVP_CIPH_GCM_MODE:
+      return "gcm";
+    case EVP_CIPH_OCB_MODE:
+      return "ocb";
+    case EVP_CIPH_OFB_MODE:
+      return "ofb";
+    case EVP_CIPH_WRAP_MODE:
+      return "wrap";
+    case EVP_CIPH_XTS_MODE:
+      return "xts";
+    case EVP_CIPH_STREAM_CIPHER:
+      return "stream";
+  }
+  return "{unknown}";
 }
 
 const char* Cipher::getName() const {
@@ -3352,76 +3375,6 @@ int Cipher::bytesToKey(const Digest& digest,
                        unsigned char* iv) const {
   return EVP_BytesToKey(
       *this, Digest::MD5, nullptr, input.data, input.len, 1, key, iv);
-}
-
-template class ModeMixin<Cipher>;
-
-namespace {
-struct CipherCallbackContext {
-  Cipher::CipherNameCallback cb;
-  void operator()(const char* name) { cb(name); }
-};
-
-#if OPENSSL_VERSION_MAJOR >= 3
-template <class TypeName,
-          TypeName* fetch_type(OSSL_LIB_CTX*, const char*, const char*),
-          void free_type(TypeName*),
-          const TypeName* getbyname(const char*),
-          const char* getname(const TypeName*)>
-void array_push_back(const TypeName* evp_ref,
-                     const char* from,
-                     const char* to,
-                     void* arg) {
-  if (from == nullptr) return;
-
-  const TypeName* real_instance = getbyname(from);
-  if (!real_instance) return;
-
-  const char* real_name = getname(real_instance);
-  if (!real_name) return;
-
-  // EVP_*_fetch() does not support alias names, so we need to pass it the
-  // real/original algorithm name.
-  // We use EVP_*_fetch() as a filter here because it will only return an
-  // instance if the algorithm is supported by the public OpenSSL APIs (some
-  // algorithms are used internally by OpenSSL and are also passed to this
-  // callback).
-  TypeName* fetched = fetch_type(nullptr, real_name, nullptr);
-  if (fetched == nullptr) return;
-
-  free_type(fetched);
-  auto& cb = *(static_cast<CipherCallbackContext*>(arg));
-  cb(from);
-}
-#else
-template <class TypeName>
-void array_push_back(const TypeName* evp_ref,
-                     const char* from,
-                     const char* to,
-                     void* arg) {
-  if (!from) return;
-  auto& cb = *(static_cast<CipherCallbackContext*>(arg));
-  cb(from);
-}
-#endif
-}  // namespace
-
-void Cipher::ForEach(Cipher::CipherNameCallback callback) {
-  ClearErrorOnReturn clearErrorOnReturn;
-  CipherCallbackContext context;
-  context.cb = std::move(callback);
-
-  EVP_CIPHER_do_all_sorted(
-#if OPENSSL_VERSION_MAJOR >= 3
-      array_push_back<EVP_CIPHER,
-                      EVP_CIPHER_fetch,
-                      EVP_CIPHER_free,
-                      EVP_get_cipherbyname,
-                      EVP_CIPHER_get0_name>,
-#else
-      array_push_back<EVP_CIPHER>,
-#endif
-      &context);
 }
 
 // ============================================================================
@@ -3470,19 +3423,21 @@ bool CipherCtxPointer::setKeyLength(size_t length) {
 bool CipherCtxPointer::setIvLength(size_t length) {
   if (!ctx_) return false;
   return EVP_CIPHER_CTX_ctrl(
-      ctx_.get(), EVP_CTRL_AEAD_SET_IVLEN, length, nullptr);
+             ctx_.get(), EVP_CTRL_AEAD_SET_IVLEN, length, nullptr) > 0;
 }
 
 bool CipherCtxPointer::setAeadTag(const Buffer<const char>& tag) {
   if (!ctx_) return false;
-  return EVP_CIPHER_CTX_ctrl(
-      ctx_.get(), EVP_CTRL_AEAD_SET_TAG, tag.len, const_cast<char*>(tag.data));
+  return EVP_CIPHER_CTX_ctrl(ctx_.get(),
+                             EVP_CTRL_AEAD_SET_TAG,
+                             tag.len,
+                             const_cast<char*>(tag.data)) > 0;
 }
 
 bool CipherCtxPointer::setAeadTagLength(size_t length) {
   if (!ctx_) return false;
   return EVP_CIPHER_CTX_ctrl(
-      ctx_.get(), EVP_CTRL_AEAD_SET_TAG, length, nullptr);
+             ctx_.get(), EVP_CTRL_AEAD_SET_TAG, length, nullptr) > 0;
 }
 
 bool CipherCtxPointer::setPadding(bool padding) {
@@ -3498,11 +3453,6 @@ int CipherCtxPointer::getBlockSize() const {
 int CipherCtxPointer::getMode() const {
   if (!ctx_) return 0;
   return EVP_CIPHER_CTX_mode(ctx_.get());
-}
-
-int CipherCtxPointer::getNid() const {
-  if (!ctx_) return 0;
-  return EVP_CIPHER_CTX_nid(ctx_.get());
 }
 
 bool CipherCtxPointer::isGcmMode() const {
@@ -3530,6 +3480,11 @@ bool CipherCtxPointer::isChaCha20Poly1305() const {
   return getNid() == NID_chacha20_poly1305;
 }
 
+int CipherCtxPointer::getNid() const {
+  if (!ctx_) return 0;
+  return EVP_CIPHER_CTX_nid(ctx_.get());
+}
+
 bool CipherCtxPointer::init(const Cipher& cipher,
                             bool encrypt,
                             const unsigned char* key,
@@ -3552,7 +3507,7 @@ bool CipherCtxPointer::update(const Buffer<const unsigned char>& in,
 
 bool CipherCtxPointer::getAeadTag(size_t len, unsigned char* out) {
   if (!ctx_) return false;
-  return EVP_CIPHER_CTX_ctrl(ctx_.get(), EVP_CTRL_AEAD_GET_TAG, len, out);
+  return EVP_CIPHER_CTX_ctrl(ctx_.get(), EVP_CTRL_AEAD_GET_TAG, len, out) > 0;
 }
 
 // ============================================================================
@@ -3735,8 +3690,38 @@ bool ECKeyPointer::setPublicKey(const ECPointPointer& pub) {
 bool ECKeyPointer::setPublicKeyRaw(const BignumPointer& x,
                                    const BignumPointer& y) {
   if (!key_) return false;
-  return EC_KEY_set_public_key_affine_coordinates(
-             key_.get(), x.get(), y.get()) == 1;
+  const EC_GROUP* group = EC_KEY_get0_group(key_.get());
+  if (group == nullptr) return false;
+
+  // For curves with cofactor h=1, use EC_POINT_oct2point +
+  // EC_KEY_set_public_key instead of EC_KEY_set_public_key_affine_coordinates.
+  // The latter internally calls EC_KEY_check_key() which performs a scalar
+  // multiplication (n*Q) for order validation — redundant when h=1 since every
+  // on-curve point already has order n. EC_POINT_oct2point validates the point
+  // is on the curve, which is sufficient. For curves with h!=1, fall back to
+  // the full check.
+  auto cofactor = BignumPointer::New();
+  if (!cofactor || !EC_GROUP_get_cofactor(group, cofactor.get(), nullptr) ||
+      !cofactor.isOne()) {
+    return EC_KEY_set_public_key_affine_coordinates(
+               key_.get(), x.get(), y.get()) == 1;
+  }
+
+  // Field element byte length: ceil(degree_bits / 8).
+  size_t field_len = (EC_GROUP_get_degree(group) + 7) / 8;
+  // Build an uncompressed point: 0x04 || x || y, each padded to field_len.
+  size_t uncompressed_len = 1 + 2 * field_len;
+  auto buf = DataPointer::Alloc(uncompressed_len);
+  if (!buf) return false;
+  unsigned char* ptr = static_cast<unsigned char*>(buf.get());
+  ptr[0] = POINT_CONVERSION_UNCOMPRESSED;
+  x.encodePaddedInto(ptr + 1, field_len);
+  y.encodePaddedInto(ptr + 1 + field_len, field_len);
+
+  auto point = ECPointPointer::New(group);
+  if (!point) return false;
+  if (!point.setFromBuffer({ptr, uncompressed_len}, group)) return false;
+  return EC_KEY_set_public_key(key_.get(), point.get()) == 1;
 }
 
 bool ECKeyPointer::setPrivateKey(const BignumPointer& priv) {
@@ -4230,14 +4215,9 @@ const std::optional<Rsa::PssParams> Rsa::getPssParams() const {
   }
 
   if (params->saltLength != nullptr) {
-    // Older versions of openssl/boringssl do not implement
-    // ASN1_INTEGER_get_int64, which the salt length here technically
-    // is. Let's walk it through uint64_t with a conversion.
-    uint64_t temp;
-    if (ASN1_INTEGER_get_uint64(&temp, params->saltLength) != 1) {
+    if (ASN1_INTEGER_get_int64(&ret.salt_length, params->saltLength) != 1) {
       return std::nullopt;
     }
-    ret.salt_length = static_cast<int64_t>(temp);
   }
   return ret;
 }
@@ -4322,6 +4302,74 @@ DataPointer Cipher::recover(const EVPKeyPointer& key,
       key, params, in);
 }
 
+namespace {
+struct CipherCallbackContext {
+  Cipher::CipherNameCallback cb;
+  void operator()(const char* name) { cb(name); }
+};
+
+#if OPENSSL_VERSION_MAJOR >= 3
+template <class TypeName,
+          TypeName* fetch_type(OSSL_LIB_CTX*, const char*, const char*),
+          void free_type(TypeName*),
+          const TypeName* getbyname(const char*),
+          const char* getname(const TypeName*)>
+void array_push_back(const TypeName* evp_ref,
+                     const char* from,
+                     const char* to,
+                     void* arg) {
+  if (from == nullptr) return;
+
+  const TypeName* real_instance = getbyname(from);
+  if (!real_instance) return;
+
+  const char* real_name = getname(real_instance);
+  if (!real_name) return;
+
+  // EVP_*_fetch() does not support alias names, so we need to pass it the
+  // real/original algorithm name.
+  // We use EVP_*_fetch() as a filter here because it will only return an
+  // instance if the algorithm is supported by the public OpenSSL APIs (some
+  // algorithms are used internally by OpenSSL and are also passed to this
+  // callback).
+  TypeName* fetched = fetch_type(nullptr, real_name, nullptr);
+  if (fetched == nullptr) return;
+
+  free_type(fetched);
+  auto& cb = *(static_cast<CipherCallbackContext*>(arg));
+  cb(from);
+}
+#else
+template <class TypeName>
+void array_push_back(const TypeName* evp_ref,
+                     const char* from,
+                     const char* to,
+                     void* arg) {
+  if (!from) return;
+  auto& cb = *(static_cast<CipherCallbackContext*>(arg));
+  cb(from);
+}
+#endif
+}  // namespace
+
+void Cipher::ForEach(Cipher::CipherNameCallback callback) {
+  ClearErrorOnReturn clearErrorOnReturn;
+  CipherCallbackContext context;
+  context.cb = std::move(callback);
+
+  EVP_CIPHER_do_all_sorted(
+#if OPENSSL_VERSION_MAJOR >= 3
+      array_push_back<EVP_CIPHER,
+                      EVP_CIPHER_fetch,
+                      EVP_CIPHER_free,
+                      EVP_get_cipherbyname,
+                      EVP_CIPHER_get0_name>,
+#else
+      array_push_back<EVP_CIPHER>,
+#endif
+      &context);
+}
+
 // ============================================================================
 
 Ec::Ec() : ec_(nullptr) {}
@@ -4343,6 +4391,22 @@ int Ec::getCurve() const {
   return EC_GROUP_get_curve_name(getGroup());
 }
 
+uint32_t Ec::getDegree() const {
+  return EC_GROUP_get_degree(getGroup());
+}
+
+std::string Ec::getCurveName() const {
+  return std::string(OBJ_nid2sn(getCurve()));
+}
+
+const EC_POINT* Ec::getPublicKey() const {
+  return EC_KEY_get0_public_key(ec_);
+}
+
+const BIGNUM* Ec::getPrivateKey() const {
+  return EC_KEY_get0_private_key(ec_);
+}
+
 int Ec::GetCurveIdFromName(const char* name) {
   int nid = EC_curve_nist2nid(name);
   if (nid == NID_undef) {
@@ -4361,22 +4425,6 @@ bool Ec::GetCurves(Ec::GetCurveCallback callback) {
     if (!callback(OBJ_nid2sn(curve.nid))) return false;
   }
   return true;
-}
-
-uint32_t Ec::getDegree() const {
-  return EC_GROUP_get_degree(getGroup());
-}
-
-std::string Ec::getCurveName() const {
-  return std::string(OBJ_nid2sn(getCurve()));
-}
-
-const EC_POINT* Ec::getPublicKey() const {
-  return EC_KEY_get0_public_key(ec_);
-}
-
-const BIGNUM* Ec::getPrivateKey() const {
-  return EC_KEY_get0_private_key(ec_);
 }
 
 // ============================================================================
@@ -4495,6 +4543,27 @@ std::optional<EVP_PKEY_CTX*> EVPMDCtxPointer::signInitWithContext(
 #ifdef OSSL_SIGNATURE_PARAM_CONTEXT_STRING
   EVP_PKEY_CTX* ctx = nullptr;
 
+#ifdef OSSL_SIGNATURE_PARAM_INSTANCE
+  // Ed25519 requires the INSTANCE param to switch into Ed25519ctx mode.
+  // Without it, OpenSSL silently ignores the context string.
+  if (key.id() == EVP_PKEY_ED25519) {
+    const OSSL_PARAM params[] = {
+        OSSL_PARAM_construct_utf8_string(
+            OSSL_SIGNATURE_PARAM_INSTANCE, const_cast<char*>("Ed25519ctx"), 0),
+        OSSL_PARAM_construct_octet_string(
+            OSSL_SIGNATURE_PARAM_CONTEXT_STRING,
+            const_cast<unsigned char*>(context_string.data),
+            context_string.len),
+        OSSL_PARAM_END};
+
+    if (!EVP_DigestSignInit_ex(
+            ctx_.get(), &ctx, nullptr, nullptr, nullptr, key.get(), params)) {
+      return std::nullopt;
+    }
+    return ctx;
+  }
+#endif  // OSSL_SIGNATURE_PARAM_INSTANCE
+
   const OSSL_PARAM params[] = {
       OSSL_PARAM_construct_octet_string(
           OSSL_SIGNATURE_PARAM_CONTEXT_STRING,
@@ -4518,6 +4587,27 @@ std::optional<EVP_PKEY_CTX*> EVPMDCtxPointer::verifyInitWithContext(
     const Buffer<const unsigned char>& context_string) {
 #ifdef OSSL_SIGNATURE_PARAM_CONTEXT_STRING
   EVP_PKEY_CTX* ctx = nullptr;
+
+#ifdef OSSL_SIGNATURE_PARAM_INSTANCE
+  // Ed25519 requires the INSTANCE param to switch into Ed25519ctx mode.
+  // Without it, OpenSSL silently ignores the context string.
+  if (key.id() == EVP_PKEY_ED25519) {
+    const OSSL_PARAM params[] = {
+        OSSL_PARAM_construct_utf8_string(
+            OSSL_SIGNATURE_PARAM_INSTANCE, const_cast<char*>("Ed25519ctx"), 0),
+        OSSL_PARAM_construct_octet_string(
+            OSSL_SIGNATURE_PARAM_CONTEXT_STRING,
+            const_cast<unsigned char*>(context_string.data),
+            context_string.len),
+        OSSL_PARAM_END};
+
+    if (!EVP_DigestVerifyInit_ex(
+            ctx_.get(), &ctx, nullptr, nullptr, nullptr, key.get(), params)) {
+      return std::nullopt;
+    }
+    return ctx;
+  }
+#endif  // OSSL_SIGNATURE_PARAM_INSTANCE
 
   const OSSL_PARAM params[] = {
       OSSL_PARAM_construct_octet_string(
@@ -4817,12 +4907,12 @@ bool X509Name::Iterator::operator!=(const Iterator& other) const {
 std::pair<std::string, std::string> X509Name::Iterator::operator*() const {
   if (loc_ == name_.total_) return {{}, {}};
 
-  X509_NAME_ENTRY* entry = X509_NAME_get_entry(name_, loc_);
+  const X509_NAME_ENTRY* entry = X509_NAME_get_entry(name_, loc_);
   if (entry == nullptr) [[unlikely]]
     return {{}, {}};
 
-  ASN1_OBJECT* name = X509_NAME_ENTRY_get_object(entry);
-  ASN1_STRING* value = X509_NAME_ENTRY_get_data(entry);
+  const ASN1_OBJECT* name = X509_NAME_ENTRY_get_object(entry);
+  const ASN1_STRING* value = X509_NAME_ENTRY_get_data(entry);
 
   if (name == nullptr || value == nullptr) [[unlikely]] {
     return {{}, {}};
@@ -4841,9 +4931,10 @@ std::pair<std::string, std::string> X509Name::Iterator::operator*() const {
   unsigned char* value_str;
   int value_str_size = ASN1_STRING_to_UTF8(&value_str, value);
 
-  return {
-      std::move(name_str),
-      std::string(reinterpret_cast<const char*>(value_str), value_str_size)};
+  std::string out(reinterpret_cast<const char*>(value_str), value_str_size);
+  OPENSSL_free(value_str);  // free after copy
+
+  return {std::move(name_str), std::move(out)};
 }
 
 // ============================================================================
@@ -5014,289 +5105,6 @@ DataPointer KEM::Decapsulate(const EVPKeyPointer& private_key,
 
 #endif  // OPENSSL_VERSION_MAJOR >= 3
 
-// ============================================================================
-// AEAD (Authenticated Encryption with Associated Data)
-#ifdef OPENSSL_IS_BORINGSSL
-
-const Aead Aead::FromName(std::string_view name) {
-  for (const auto& [construct, info] : aeadIndex) {
-    if (EqualNoCase(info.name, name)) {
-      return Aead(&info, construct());
-    }
-  }
-
-  return Aead();
-}
-
-const Aead Aead::FromCtx(std::string_view name, const AeadCtxPointer& ctx) {
-  for (const auto& [_, info] : aeadIndex) {
-    if (info.name == name) {
-      return Aead(&info, EVP_AEAD_CTX_aead(ctx.get()));
-    }
-  }
-
-  return Aead();
-}
-
-int Aead::getMode() const {
-  if (!aead_) return -1;
-
-  return info_->mode;
-}
-
-int Aead::getNonceLength() const {
-  if (!aead_) return 0;
-  return EVP_AEAD_nonce_length(aead_);
-}
-
-int Aead::getKeyLength() const {
-  if (!aead_) return 0;
-  return EVP_AEAD_key_length(aead_);
-}
-
-int Aead::getMaxOverhead() const {
-  if (!aead_) return 0;
-  return EVP_AEAD_max_overhead(aead_);
-}
-
-int Aead::getMaxTagLength() const {
-  if (!aead_) return 0;
-  return EVP_AEAD_max_tag_len(aead_);
-}
-
-int Aead::getBlockSize() const {
-  if (!aead_) return 0;
-
-  // EVP_CIPHER_CTX_block_size returns the block size, in bytes, of the cipher
-  // underlying |ctx|, or one if the cipher is a stream cipher.
-  return 1;
-}
-
-std::string_view Aead::getName() const {
-  if (!aead_) return "";
-
-  return info_->name;
-}
-
-int Aead::getNid() const {
-  if (!aead_) return 0;
-
-  return info_->nid;
-}
-
-const Aead Aead::FromConstructor(Aead::AeadConstructor construct) {
-  return Aead(&aeadIndex.at(construct), construct());
-}
-
-const std::unordered_map<Aead::AeadConstructor, Aead::AeadInfo>
-    Aead::aeadIndex = {
-        {EVP_aead_aes_128_gcm,
-         {.name = LN_aes_128_gcm,
-          .mode = EVP_CIPH_GCM_MODE,
-          .nid = NID_aes_128_gcm}},
-        {EVP_aead_aes_192_gcm,
-         {.name = LN_aes_192_gcm,
-          .mode = EVP_CIPH_GCM_MODE,
-          .nid = NID_aes_192_gcm}},
-        {EVP_aead_aes_256_gcm,
-         {.name = LN_aes_256_gcm,
-          .mode = EVP_CIPH_GCM_MODE,
-          .nid = NID_aes_256_gcm}},
-        {EVP_aead_chacha20_poly1305,
-         {.name = LN_chacha20_poly1305,
-          .mode = EVP_CIPH_STREAM_CIPHER,
-          .nid = NID_chacha20_poly1305}},
-        {EVP_aead_xchacha20_poly1305,
-         {
-             .name = "xchacha20-poly1305",
-             .mode = EVP_CIPH_STREAM_CIPHER,
-         }},
-        {EVP_aead_aes_128_ctr_hmac_sha256,
-         {
-             .name = "aes-128-ctr-hmac-sha256",
-             .mode = EVP_CIPH_CTR_MODE,
-         }},
-        {EVP_aead_aes_256_ctr_hmac_sha256,
-         {
-             .name = "aes-256-ctr-hmac-sha256",
-             .mode = EVP_CIPH_CTR_MODE,
-         }},
-        {EVP_aead_aes_128_gcm_siv,
-         {
-             .name = "aes-128-gcm-siv",
-             .mode = EVP_CIPH_GCM_MODE,
-         }},
-        {EVP_aead_aes_256_gcm_siv,
-         {
-             .name = "aes-256-gcm-siv",
-             .mode = EVP_CIPH_GCM_MODE,
-         }},
-        {EVP_aead_aes_128_gcm_randnonce,
-         {
-             .name = "aes-128-gcm-randnonce",
-             .mode = EVP_CIPH_GCM_MODE,
-         }},
-        {EVP_aead_aes_256_gcm_randnonce,
-         {
-             .name = "aes-256-gcm-randnonce",
-             .mode = EVP_CIPH_GCM_MODE,
-         }},
-        {EVP_aead_aes_128_ccm_bluetooth,
-         {
-             .name = "aes-128-ccm-bluetooth",
-             .mode = EVP_CIPH_CCM_MODE,
-         }},
-        {EVP_aead_aes_128_ccm_bluetooth_8,
-         {
-             .name = "aes-128-ccm-bluetooth-8",
-             .mode = EVP_CIPH_CCM_MODE,
-         }},
-        {EVP_aead_aes_128_ccm_matter,
-         {
-             .name = "aes-128-ccm-matter",
-             .mode = EVP_CIPH_CCM_MODE,
-         }},
-        {EVP_aead_aes_128_eax,
-         {.name = "aes-128-eax",
-          // BoringSSL does not define a mode constant for EAX. Using STREAM
-          // arbitrarily
-          .mode = EVP_CIPH_STREAM_CIPHER}},
-        {EVP_aead_aes_256_eax,
-         {.name = "aes-256-eax",
-          // BoringSSL does not define a mode constant for EAX. Using STREAM
-          // arbitrarily
-          .mode = EVP_CIPH_STREAM_CIPHER}},
-    };
-
-void Aead::ForEach(AeadNameCallback callback) {
-  for (const auto& [_, info] : aeadIndex) {
-    callback(info.name);
-  }
-}
-
-const Aead Aead::EMPTY = Aead();
-const Aead Aead::AES_128_GCM = Aead::FromConstructor(EVP_aead_aes_128_gcm);
-const Aead Aead::AES_192_GCM = Aead::FromConstructor(EVP_aead_aes_192_gcm);
-const Aead Aead::AES_256_GCM = Aead::FromConstructor(EVP_aead_aes_256_gcm);
-const Aead Aead::CHACHA20_POLY1305 =
-    Aead::FromConstructor(EVP_aead_chacha20_poly1305);
-const Aead Aead::XCHACHA20_POLY1305 =
-    Aead::FromConstructor(EVP_aead_xchacha20_poly1305);
-const Aead Aead::AES_128_CTR_HMAC_SHA256 =
-    Aead::FromConstructor(EVP_aead_aes_128_ctr_hmac_sha256);
-const Aead Aead::AES_256_CTR_HMAC_SHA256 =
-    Aead::FromConstructor(EVP_aead_aes_256_ctr_hmac_sha256);
-const Aead Aead::AES_128_GCM_SIV =
-    Aead::FromConstructor(EVP_aead_aes_128_gcm_siv);
-const Aead Aead::AES_256_GCM_SIV =
-    Aead::FromConstructor(EVP_aead_aes_256_gcm_siv);
-const Aead Aead::AES_128_GCM_RANDNONCE =
-    Aead::FromConstructor(EVP_aead_aes_128_gcm_randnonce);
-const Aead Aead::AES_256_GCM_RANDNONCE =
-    Aead::FromConstructor(EVP_aead_aes_256_gcm_randnonce);
-const Aead Aead::AES_128_CCM_BLUETOOTH =
-    Aead::FromConstructor(EVP_aead_aes_128_ccm_bluetooth);
-const Aead Aead::AES_128_CCM_BLUETOOTH_8 =
-    Aead::FromConstructor(EVP_aead_aes_128_ccm_bluetooth_8);
-const Aead Aead::AES_128_CCM_MATTER =
-    Aead::FromConstructor(EVP_aead_aes_128_ccm_matter);
-const Aead Aead::AES_128_EAX = Aead::FromConstructor(EVP_aead_aes_128_eax);
-const Aead Aead::AES_256_EAX = Aead::FromConstructor(EVP_aead_aes_256_eax);
-
-template class ModeMixin<Aead>;
-
-AeadCtxPointer AeadCtxPointer::New(const Aead& aead,
-                                   bool encrypt,
-                                   const unsigned char* key,
-                                   size_t keyLen,
-                                   size_t tagLen) {
-  // Note: In the EVP_AEAD API new always calls init
-  auto ret = AeadCtxPointer(EVP_AEAD_CTX_new(aead.get(), key, keyLen, tagLen));
-
-  if (!ret) {
-    return {};
-  }
-
-  return ret;
-}
-
-AeadCtxPointer::AeadCtxPointer(EVP_AEAD_CTX* ctx) : ctx_(ctx) {}
-
-AeadCtxPointer::AeadCtxPointer(AeadCtxPointer&& other) noexcept
-    : ctx_(other.release()) {}
-
-AeadCtxPointer& AeadCtxPointer::operator=(AeadCtxPointer&& other) noexcept {
-  if (this == &other) return *this;
-  this->~AeadCtxPointer();
-  return *new (this) AeadCtxPointer(std::move(other));
-}
-
-AeadCtxPointer::~AeadCtxPointer() {
-  reset();
-}
-
-void AeadCtxPointer::reset(EVP_AEAD_CTX* ctx) {
-  ctx_.reset(ctx);
-}
-
-EVP_AEAD_CTX* AeadCtxPointer::release() {
-  return ctx_.release();
-}
-
-bool AeadCtxPointer::init(const Aead& aead,
-                          bool encrypt,
-                          const unsigned char* key,
-                          size_t keyLen,
-                          size_t tagLen) {
-  return EVP_AEAD_CTX_init_with_direction(
-      ctx_.get(),
-      aead,
-      key,
-      keyLen,
-      tagLen,
-      encrypt ? evp_aead_seal : evp_aead_open);
-}
-
-bool AeadCtxPointer::encrypt(const Buffer<const unsigned char>& in,
-                             Buffer<unsigned char>& out,
-                             Buffer<unsigned char>& tag,
-                             const Buffer<const unsigned char>& nonce,
-                             const Buffer<const unsigned char>& aad) {
-  if (!ctx_) return false;
-  return EVP_AEAD_CTX_seal_scatter(ctx_.get(),
-                                   out.data,
-                                   tag.data,
-                                   &tag.len,
-                                   tag.len,
-                                   nonce.data,
-                                   nonce.len,
-                                   in.data,
-                                   in.len,
-                                   nullptr /* extra_in */,
-                                   0 /* extra_in_len */,
-                                   aad.data,
-                                   aad.len) == 1;
-}
-
-bool AeadCtxPointer::decrypt(const Buffer<const unsigned char>& in,
-                             Buffer<unsigned char>& out,
-                             const Buffer<const unsigned char>& tag,
-                             const Buffer<const unsigned char>& nonce,
-                             const Buffer<const unsigned char>& aad) {
-  if (!ctx_) return false;
-
-  return EVP_AEAD_CTX_open_gather(ctx_.get(),
-                                  out.data,
-                                  nonce.data,
-                                  nonce.len,
-                                  in.data,
-                                  in.len,
-                                  tag.data,
-                                  tag.len,
-                                  aad.data,
-                                  aad.len) == 1;
-}
-#endif
 }  // namespace ncrypto
 
 // ===========================================================================

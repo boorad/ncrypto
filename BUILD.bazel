@@ -1,4 +1,5 @@
 load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
 
 bool_flag(
     name = "bssl_libdecrepit_missing",
@@ -15,7 +16,14 @@ config_setting(
 cc_library(
     name = "ncrypto",
     srcs = glob(["src/*.cpp"]),
-    hdrs = glob(["include/*.h"]),
+    hdrs = glob(["include/*.h", "include/ncrypto/*.h"]),
+    copts = [
+        "-Werror",
+        "-Wextra",
+        "-Wno-unused-parameter",
+        "-Wimplicit-fallthrough",
+        "-Wno-deprecated-declarations",  # OpenSSL 3.0 deprecates many APIs we intentionally use
+    ],
     includes = ["include"],
     local_defines = {
         "NCRYPTO_BSSL_LIBDECREPIT_MISSING": select(
