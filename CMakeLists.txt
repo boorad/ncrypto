@@ -5,6 +5,8 @@ include(CTest)
 include(GNUInstallDirs)
 include(cmake/ncrypto-flags.cmake)
 
+option(NCRYPTO_EVP_ONLY "Build against the OpenSSL 3.6+ EVP/provider API only" OFF)
+
 if (NOT CMAKE_BUILD_TYPE)
   message(STATUS "No build type selected, default to Release")
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build." FORCE)
@@ -13,6 +15,9 @@ endif()
 if (NCRYPTO_SHARED_LIBS)
   find_package(OpenSSL REQUIRED)
 else()
+  if (NCRYPTO_EVP_ONLY)
+    message(FATAL_ERROR "NCRYPTO_EVP_ONLY requires OpenSSL 3.6 or newer")
+  endif()
   include(FetchContent)
   include(cmake/CPM.cmake)
 
@@ -23,6 +28,10 @@ else()
     GIT_TAG 0.20260508.0
     OPTIONS "BUILD_SHARED_LIBS OFF" "BUILD_TESTING OFF"
   )
+endif()
+
+if (NCRYPTO_EVP_ONLY AND OPENSSL_VERSION VERSION_LESS "3.6.0")
+  message(FATAL_ERROR "NCRYPTO_EVP_ONLY requires OpenSSL 3.6 or newer")
 endif()
 
 add_subdirectory(src)
@@ -67,6 +76,11 @@ install(
 )
 
 # Generate pkg-config file
+if (NCRYPTO_EVP_ONLY)
+  set(NCRYPTO_PKG_CONFIG_CFLAGS " -DNCRYPTO_EVP_ONLY=1")
+else()
+  set(NCRYPTO_PKG_CONFIG_CFLAGS "")
+endif()
 configure_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/ncrypto.pc.in
   ${CMAKE_CURRENT_BINARY_DIR}/ncrypto.pc

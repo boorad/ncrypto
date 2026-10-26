@@ -7,4 +7,4 @@ Name: ncrypto
 Description: crypto functions for node:crypto
 Version: @PROJECT_VERSION@
 Libs: -L${libdir} -lncrypto
-Cflags: -I${includedir}
+Cflags: -I${includedir}@NCRYPTO_PKG_CONFIG_CFLAGS@
