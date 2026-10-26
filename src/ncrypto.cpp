@@ -714,7 +714,7 @@ BignumPointer BignumPointer::clone() {
   return BignumPointer(BN_dup(bn_.get()));
 }
 
-int BignumPointer::isPrime(int nchecks,
+int BignumPointer::isPrime(int nchecks [[maybe_unused]],
                            BignumPointer::PrimeCheckCallback innerCb) const {
   BignumCtxPointer ctx(BN_CTX_new());
   BignumGenCallbackPointer cb(nullptr);
@@ -847,11 +847,11 @@ bool CSPRNG(void* buffer, size_t length) {
   return false;
 }
 
-int NoPasswordCallback(char* buf, int size, int rwflag, void* u) {
+int NoPasswordCallback(char*, int, int, void*) {
   return 0;
 }
 
-int PasswordCallback(char* buf, int size, int rwflag, void* u) {
+int PasswordCallback(char* buf, int size, int, void* u) {
   auto passphrase = static_cast<const Buffer<char>*>(u);
   if (size <= 0) return -1;
   if (passphrase != nullptr) {
@@ -873,7 +873,7 @@ struct StorePassphraseData {
   bool missing_passphrase = false;
 };
 
-int StorePasswordCallback(char* buf, int size, int rwflag, void* u) {
+int StorePasswordCallback(char* buf, int size, int, void* u) {
   auto data = static_cast<StorePassphraseData*>(u);
   if (data == nullptr || !data->has_passphrase) {
     if (data != nullptr) data->missing_passphrase = true;
@@ -1659,7 +1659,7 @@ Result<X509Pointer, int> X509Pointer::Parse(
   X509Pointer pem(
       PEM_read_bio_X509_AUX(bio.get(), nullptr, NoPasswordCallback, nullptr));
   if (pem) return Result<X509Pointer, int>(std::move(pem));
-  BIO_reset(bio.get());
+  if (!bio.resetBio()) return Result<X509Pointer, int>(ERR_get_error());
 
   X509Pointer der(d2i_X509_bio(bio.get(), nullptr));
   if (der) return Result<X509Pointer, int>(std::move(der));
@@ -2893,7 +2893,7 @@ DataPointer argon2(const Buffer<const char>& pass,
                    size_t length,
                    uint32_t memcost,
                    uint32_t iter,
-                   uint32_t version,
+                   uint32_t,
                    const Buffer<const unsigned char>& secret,
                    const Buffer<const unsigned char>& ad,
                    Argon2Type type) {
@@ -4809,7 +4809,7 @@ bool Cipher::isSupportedAuthenticatedMode() const {
   }
 }
 
-int Cipher::bytesToKey(const Digest& digest,
+int Cipher::bytesToKey(const Digest&,
                        const Buffer<const unsigned char>& input,
                        unsigned char* key,
                        unsigned char* iv) const {
@@ -4995,7 +4995,7 @@ ECDSASigPointer::~ECDSASigPointer() {
   reset();
 }
 
-void ECDSASigPointer::reset(ECDSA_SIG* sig) {
+void ECDSASigPointer::reset(ECDSA_SIG*) {
   sig_.reset();
   pr_ = nullptr;
   ps_ = nullptr;
@@ -5050,7 +5050,7 @@ ECGroupPointer::~ECGroupPointer() {
   reset();
 }
 
-void ECGroupPointer::reset(EC_GROUP* group) {
+void ECGroupPointer::reset(EC_GROUP*) {
   group_.reset();
 }
 
@@ -6408,9 +6408,9 @@ template <class TypeName,
           void free_type(TypeName*),
           const TypeName* getbyname(const char*),
           const char* getname(const TypeName*)>
-void array_push_back(const TypeName* evp_ref,
+void array_push_back(const TypeName*,
                      const char* from,
-                     const char* to,
+                     const char*,
                      void* arg) {
   if (from == nullptr) return;
 
@@ -6770,6 +6770,7 @@ std::optional<EVP_PKEY_CTX*> EVPMDCtxPointer::signInitWithContext(
   }
   return ctx;
 #elif defined(OSSL_SIGNATURE_PARAM_CONTEXT_STRING)
+  (void)digest;
   EVP_PKEY_CTX* ctx = nullptr;
 
 #ifdef OSSL_SIGNATURE_PARAM_INSTANCE
@@ -6825,6 +6826,7 @@ std::optional<EVP_PKEY_CTX*> EVPMDCtxPointer::verifyInitWithContext(
   }
   return ctx;
 #elif defined(OSSL_SIGNATURE_PARAM_CONTEXT_STRING)
+  (void)digest;
   EVP_PKEY_CTX* ctx = nullptr;
 
 #ifdef OSSL_SIGNATURE_PARAM_INSTANCE
